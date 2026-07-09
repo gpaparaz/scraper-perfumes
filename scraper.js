@@ -29,7 +29,6 @@ async function startScraping(letter) {
     console.log(`Starting scraper for letter: [${letter}]`);
     const urlsToScan = [];
     
-    // Phase 1: Index Scanning
     for (let page = 1; page <= 7; page++) {
         console.log(`Scanning index page ${page}/7...`);
         const indexUrl = `${BASE_URL}/it/pages/glossary-terms?page_b4e05a4c=${page}`;
@@ -63,7 +62,6 @@ async function startScraping(letter) {
     console.log(`Found ${urlsToScan.length} terms for letter ${letter}.`);
     if (urlsToScan.length === 0) return;
 
-    // Phase 2: Structured Extraction
     const glossaryData = [];
 
     for (let i = 0; i < urlsToScan.length; i++) {
@@ -80,7 +78,7 @@ async function startScraping(letter) {
             const title = $('h1').text().trim();
             const category = $('.pp-wiki-sub').text().trim() || 'N/D';
 
-            // 1. Technical Card Extraction
+            // 1. Technical Card (Perfect mapping)
             const techCard = {};
             $('.pp-wiki-ib table tr').each((idx, el) => {
                 const key = $(el).find('td').eq(0).text().replace(/:/g, '').trim();
@@ -88,10 +86,7 @@ async function startScraping(letter) {
                 if (key && value) techCard[key] = value;
             });
 
-            // 2. Short Description (The block highlighted with a left border)
-            const shortDesc = $('.pp-wiki-ff').text().replace(/Pyramid|Cuore/g, '').replace(/\s+/g, ' ').trim() || 'N/D';
-
-            // 3. Evolution Timeline
+            // 2. Evolution Timeline (Perfect mapping)
             const evolution = {};
             $('.pp-evo-card').each((idx, el) => {
                 const label = $(el).find('.pp-evo-card__label').text().trim();
@@ -99,43 +94,19 @@ async function startScraping(letter) {
                 if (label && desc) evolution[label] = desc;
             });
 
-            // 4. Content Sections Parsing (State-machine approach based on H2 text)
-            let scentProfile = '';
-            let fullStory = '';
-            let funFact = '';
-            let inInPerfumes = '';
+            // 3. Raw Text Body Cleanup (Gather all clean paragraphs to avoid site structural bugs)
+            $('script, style, details, summary, noscript, .pp-wiki-bc, h1, .pp-wiki-sub, .pp-wiki-ib').remove();
+            
+            // Extract the first clean paragraph as the real short description
+            const realShortDesc = $('.pp-wiki-body p').first().text().replace(/\s+/g, ' ').trim() || 'N/D';
 
-            // Remove scripts and styles to avoid code leaking into text
-            $('script, style, details, summary, noscript').remove();
-
-            // We iterate through all direct children of the content body
-            let currentSection = '';
-            $('.pp-wiki-body').children().each((idx, el) => {
-                const node = $(el);
-
-                // When we hit an H2, we change the current section target
-                if (node.is('h2')) {
-                    const h2Text = node.text().toLowerCase().trim();
-                    if (h2Text.includes('scent') || h2Text.includes('profumo')) {
-                        currentSection = 'scent';
-                    } else if (h2Text.includes('story') || h2Text.includes('storia')) {
-                        currentSection = 'story';
-                    } else if (h2Text.includes('did you know') || h2Text.includes('sapevi') || h2Text.includes('fact') || h2Text.includes('curiosità')) {
-                        currentSection = 'fact';
-                    } else if (h2Text.includes('perfumery') || h2Text.includes('profumeria')) {
-                        currentSection = 'perfumes';
-                    } else {
-                        currentSection = ''; // Reset for untracked sections like extraction/chemistry
-                    }
-                } 
-                // If it's a paragraph, we append the text to the active section
-                else if (node.is('p') || node.hasClass('metafield-rich_text_field')) {
-                    const paragraphText = node.text().replace(/\s+/g, ' ').trim();
-                    if (paragraphText && !paragraphText.startsWith('{')) {
-                        if (currentSection === 'scent') scentProfile += paragraphText + ' ';
-                        if (currentSection === 'story') fullStory += paragraphText + ' ';
-                        if (currentSection === 'fact') funFact += paragraphText + ' ';
-                        if (currentSection === 'perfumes') inInPerfumes += paragraphText + ' ';
+            let fullContentText = '';
+            $('.pp-wiki-body p, .metafield-rich_text_field p').each((idx, el) => {
+                const txt = $(el).text().replace(/\s+/g, ' ').trim();
+                // Filter out junk lines or shop button code
+                if (txt && !txt.startsWith('{') && !txt.includes('function()') && !txt.includes('Discovery Set')) {
+                    if (!fullContentText.includes(txt)) { // Avoid duplicate paragraphs printed by Shopify
+                        fullContentText += txt + '\n\n';
                     }
                 }
             });
@@ -144,18 +115,15 @@ async function startScraping(letter) {
                 glossaryData.push({
                     term: title,
                     category: category,
-                    short_description: shortDesc,
+                    short_description: realShortDesc,
                     technical_card: techCard,
-                    scent_profile: scentProfile.trim(),
                     evolution: evolution,
-                    full_story: fullStory.trim(),
-                    in_perfumery: inInPerfumes.trim(),
-                    fun_fact: funFact.trim(),
+                    extracted_text_body: fullContentText.trim(),
                     url: termUrl
                 });
 
                 fs.writeFileSync(
-                    `structured_glossary_${letter}.json`, 
+                    `final_glossary_${letter}.json`, 
                     JSON.stringify(glossaryData, null, 2), 
                     'utf-8'
                 );
@@ -168,5 +136,5 @@ async function startScraping(letter) {
         }
     }
 
-    console.log(`Process complete. Output saved to structured_glossary_${letter}.json`);
+    console.log(`Process complete. Output saved to final_glossary_${letter}.json`);
 }
