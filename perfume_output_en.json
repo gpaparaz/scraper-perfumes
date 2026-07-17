@@ -1,0 +1,69 @@
+{
+  "title": "Guerlain Shalimar Parfum Initial L'Eau Guerlain perfume - a fragrance for women 2012",
+  "brand": "Guerlain",
+  "perfumer": "Thierry Wasser",
+  "description": "Guerlain Shalimar Parfum Initial L'Eau  by Guerlain is a Oriental Floral fragrance for women. Guerlain Shalimar Parfum Initial L'Eau  was launched in 2012. The nose behind this fragrance is Thierry Wasser. Top notes are Bergamot, Grapefruit, Orange and Neroli; middle notes are Iris, Hyacinth, Jasmine, Freesia, Rose and Lily-of-the-Valley; base notes are Vanille and Tonka Bean. The commercially successful experiment of Shalimar Parfum Initial (2011), a first foray for the budding Guerlain consumer into the legendary cosmos of the iconic Shalimar, continues. For 2012, Guerlain is planning on launching a flanker to this version called Shalimar Initial L'Eau. A lighter and drier spring bouquet, comprised of lily of the valley, freesia and hyacinth will garland the familiar vanillic coziness and warmth of the modernised Shalimar Initial to inject a fresh take for warmer weather, without the pitfall of too much sweetness.  It is available as 40, 60 and 100 ml EDT.",
+  "main_accords": [
+    {
+      "accord": "citrus",
+      "intensity": 100
+    },
+    {
+      "accord": "vanilla",
+      "intensity": 74.8507
+    },
+    {
+      "accord": "fresh spicy",
+      "intensity": 62.8934
+    },
+    {
+      "accord": "iris",
+      "intensity": 62.3217
+    },
+    {
+      "accord": "floral",
+      "intensity": 61.8711
+    },
+    {
+      "accord": "powdery",
+      "intensity": 60.7922
+    },
+    {
+      "accord": "aromatic",
+      "intensity": 51.7082
+    },
+    {
+      "accord": "white floral",
+      "intensity": 51.5189
+    },
+    {
+      "accord": "sweet",
+      "intensity": 48.9646
+    },
+    {
+      "accord": "green",
+      "intensity": 46.5085
+    }
+  ],
+  "pyramid": {
+    "top_notes": [
+      "Bergamot",
+      "Grapefruit",
+      "Orange",
+      "Neroli"
+    ],
+    "heart_notes": [
+      "Iris",
+      "Hyacinth",
+      "Jasmine",
+      "Freesia",
+      "Rose",
+      "Lily-of-the-Valley"
+    ],
+    "base_notes": [
+      "Vanille",
+      "Tonka Bean"
+    ]
+  },
+  "extracted_at": "2026-07-17T21:46:09.725Z"
+}
