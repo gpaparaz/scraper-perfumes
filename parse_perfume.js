@@ -1,100 +1,147 @@
+const puppeteer = require('puppeteer-extra');
+const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 const fs = require('fs');
-const cheerio = require('cheerio');
 
-function parseSavedHtml() {
-    console.log('Reading local HTML file...');
-    
-    const html = fs.readFileSync('guerlain_shalimar.html', 'utf-8');
-    const $ = cheerio.load(html);
+// Enable stealth plugin to bypass Cloudflare detection
+puppeteer.use(StealthPlugin());
 
-    // 1. Title and Brand Extraction
-    const fullTitle = $('title').text().replace('- Fragrantica', '').trim();
-    const brand = "Guerlain"; 
+async function scrapePerfume(url) {
+  console.log(`Navigating to: ${url}`);
+  
+  // Launch the browser in non-headless mode to monitor the process
+  const browser = await puppeteer.launch({ 
+    headless: false,
+    args: ['--start-maximized'] 
+  });
 
-    // 2. Main Description Extraction
-    const description = $('div[itemprop="description"]').text().trim() || $('.cell.small-12 p').first().text().trim();
+  const page = await browser.newPage();
 
-    // 3. Main Accords Extraction (UI Bars)
-    const mainAccords = [];
-    $('.accord-bar').each((idx, el) => {
-        const accordName = $(el).text().trim();
-        const styleAttr = $(el).attr('style') || '';
-        
+  // Set a standard desktop viewport
+  await page.setViewport({ width: 1366, height: 768 });
+  
+  try {
+    // Navigate to the target perfume page
+    await page.goto(url, {
+      waitUntil: 'networkidle2',
+      timeout: 60000 
+    });
+
+    // Wait for 5 seconds to ensure all asynchronous elements are fully rendered
+    await page.evaluate(() => new Promise(resolve => setTimeout(resolve, 5000)));
+
+    console.log('Extracting structural data directly from browser memory...');
+
+    // Extract data directly inside the browser context
+    const structuredData = await page.evaluate(() => {
+      // 1. Title and Brand Extraction
+      const fullTitle = document.title.replace('- Fragrantica', '').trim();
+      const brand = "Guerlain"; // Can be dynamic or hardcoded based on project needs
+
+      // 2. Description Extraction
+      let description = "";
+      const descEl = document.querySelector('div[itemprop="description"]');
+      if (descEl) {
+        description = descEl.textContent.trim();
+      } else {
+        const fallbackDesc = document.querySelector('.cell.small-12 p');
+        description = fallbackDesc ? fallbackDesc.textContent.trim() : "";
+      }
+
+      // 3. Main Accords Extraction
+      const mainAccords = [];
+      const accordBars = document.querySelectorAll('.accord-bar');
+      
+      accordBars.forEach(el => {
+        const accordName = el.textContent.trim();
+        const styleAttr = el.getAttribute('style') || '';
         let intensity = null;
+
         if (styleAttr.includes('width')) {
-            const widthValue = styleAttr.split('width:')[1]?.split('%')[0]?.trim();
-            if (widthValue) intensity = parseFloat(widthValue);
+          const widthValue = styleAttr.split('width:')[1]?.split('%')[0]?.trim();
+          if (widthValue) intensity = parseFloat(widthValue);
         }
 
         if (accordName) {
-            mainAccords.push({
-                accord: accordName,
-                intensity: intensity
-            });
+          mainAccords.push({ accord: accordName, intensity: intensity });
         }
-    });
+      });
 
-    if (mainAccords.length === 0) {
-        $('div[style*="width:"]').each((idx, el) => {
-            const style = $(el).attr('style') || '';
-            const text = $(el).text().trim();
-            if (text && text.length < 25 && !text.includes('\n')) {
-                const widthValue = style.split('width:')[1]?.split('%')[0]?.trim();
-                if (widthValue && !isNaN(widthValue)) {
-                    mainAccords.push({
-                        accord: text,
-                        intensity: parseFloat(widthValue)
-                    });
-                }
+      // Fallback for accords if primary selector returns empty
+      if (mainAccords.length === 0) {
+        const widthDivs = document.querySelectorAll('div[style*="width:"]');
+        widthDivs.forEach(el => {
+          const style = el.getAttribute('style') || '';
+          const text = el.textContent.trim();
+          if (text && text.length < 25 && !text.includes('\n')) {
+            const widthValue = style.split('width:')[1]?.split('%')[0]?.trim();
+            if (widthValue && !isNaN(widthValue)) {
+              mainAccords.push({
+                accord: text,
+                intensity: parseFloat(widthValue)
+              });
             }
+          }
         });
-    }
+      }
 
-    // 4. Olfactory Pyramid Extraction (Robust Ancestor Search)
-    const pyramid = {
+      // 4. Olfactory Pyramid Extraction
+      const pyramid = {
         top_notes: [],
         heart_notes: [],
         base_notes: []
-    };
-    
-    // Iteriamo direttamente su ogni link delle note presente nella piramide grafica
-    $('.pyramid-note-link').each((i, linkEl) => {
-        const noteName = $(linkEl).find('.pyramid-note-label').text().trim();
-        
+      };
+
+      const noteLinks = document.querySelectorAll('.pyramid-note-link');
+      noteLinks.forEach(linkEl => {
+        const labelEl = linkEl.querySelector('.pyramid-note-label');
+        const noteName = labelEl ? labelEl.textContent.trim() : null;
+
         if (noteName) {
-            // Cerchiamo l'intestazione h4 precedente più vicina a questo specifico link
-            // .prevAll('h4') o cercando l'h4 all'interno del container della sezione
-            const sectionContainer = $(linkEl).closest('.mx-auto');
-            const layerText = sectionContainer.find('h4').text().toLowerCase().trim();
-            
+          // Find the closest ancestor section container to determine the layer heading
+          const sectionContainer = linkEl.closest('.mx-auto');
+          if (sectionContainer) {
+            const h4El = sectionContainer.querySelector('h4');
+            const layerText = h4El ? h4El.textContent.toLowerCase().trim() : '';
+
             let targetLayer = null;
             if (layerText.includes('apertura') || layerText.includes('testa') || layerText.includes('top')) {
-                targetLayer = 'top_notes';
+              targetLayer = 'top_notes';
             } else if (layerText.includes('centrali') || layerText.includes('cuore') || layerText.includes('middle')) {
-                targetLayer = 'heart_notes';
+              targetLayer = 'heart_notes';
             } else if (layerText.includes('base') || layerText.includes('fondo')) {
-                targetLayer = 'base_notes';
+              targetLayer = 'base_notes';
             }
 
             if (targetLayer && !pyramid[targetLayer].includes(noteName)) {
-                pyramid[targetLayer].push(noteName);
+              pyramid[targetLayer].push(noteName);
             }
+          }
         }
-    });
+      });
 
-    // 5. Build Final Structural Database Object
-    const structuredData = {
+      return {
         title: fullTitle,
         brand: brand,
         description: description,
         main_accords: mainAccords,
         pyramid: pyramid,
         extracted_at: new Date().toISOString()
-    };
+      };
+    });
 
-    // Save output to clean JSON file
-    fs.writeFileSync('extracted_perfume_data.json', JSON.stringify(structuredData, null, 2), 'utf-8');
-    console.log('Structural parsing completed. Results saved to extracted_perfume_data.json');
+    // 5. Save the final clean JSON object directly to disk
+    const safeFileName = 'perfume_output.json';
+    fs.writeFileSync(safeFileName, JSON.stringify(structuredData, null, 2), 'utf-8');
+    console.log(`Success! Clean database schema saved directly to: ${safeFileName}`);
+
+  } catch (error) {
+    console.error('An error occurred during runtime execution:', error);
+  } finally {
+    // Ensure the browser closes at the end of the script
+    await browser.close();
+  }
 }
 
-parseSavedHtml();
+// Target URL to scrape
+const TARGET_URL = 'https://www.fragrantica.it/perfume/Guerlain/Guerlain-Shalimar-Parfum-Initial-L-Eau-14178.html';
+scrapePerfume(TARGET_URL);
