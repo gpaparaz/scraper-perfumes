@@ -10,7 +10,8 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "cheerio": "^1.0.0-rc.12",
+    "axios": "^1.18.1",
+    "cheerio": "^1.2.0",
     "csv-parse": "^7.0.1",
     "pg": "^8.22.0",
     "puppeteer": "^22.15.0",
