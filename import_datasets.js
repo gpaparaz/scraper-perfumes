@@ -1,42 +1,31 @@
 /**
- * Perfume DB import.
- *
- * Rebuilds the whole database from the source files, in this order:
- *   1. Premiere Peau glossary  -> canonical, rich ingredients
- *   2. Parfumo CSV             -> perfumes + notes (AUTHORITATIVE) + accords
- *   3. Fragrantica CSV         -> merges into existing perfumes, fills gaps,
- *                                 adds accords, adds notes only as a
- *                                 fallback, and fills perfume image_url
- *                                 (derived from the numeric id in the URL,
- *                                 no scraping needed for this one)
- *   4. ingredient_images.json  -> optional, produced by
- *                                 scrape_fragrantica_notes.js separately.
- *                                 Fills ingredients.image_url by matching
- *                                 against ingredient_aliases.
- *
- * Same perfume across sources is merged into ONE row via (brand, title)
- * after normalization. Ingredients/accords/brands are deduplicated by a
- * normalized key, and every surface form is recorded in ingredient_aliases
- * so search-by-note resolves any spelling to a single ingredient id.
- *
- * IMPORTANT: each stage now isolates errors PER ROW. A single malformed
- * row (bad CSV quoting, unexpected null, etc.) is logged and skipped
- * instead of throwing and rolling back the entire stage - this was the
- * most likely cause of "only 12k rows imported out of 60-70k": one
- * uncaught exception deep in a CSV used to wipe out that whole stage's
- * transaction, silently.
- *
- * Run from the repo root:   node import_datasets.js
- * DB credentials come from PG* env vars (see dbConfig).
- */
+   * Perfume DB import.
+   *
+   * Order:
+   *   1. Premiere Peau glossary  -> canonical, rich ingredients (GLOSSARY
+  ANCHORS)
+   *   2. Parfumo CSV             -> perfumes + notes (AUTHORITATIVE) + accords
+   *   3. Fragrantica CSV         -> merge/fill perfumes, accords, notes
+  fallback, image
+   *   3b. brand dedup            -> merge duplicate brands by title overlap
+   *   3c. ingredient reconcile   -> Policy A: fold note variants onto the most
+   *                                 specific glossary anchor, or a created
+  base;
+   *                                 glossary entries themselves are never
+  merged
+   *   4. ingredient_images.json  -> fill ingredients.image_url from the scrape
+   *   4b. photo propagation      -> share one photo across a visual group
+   *                                 (origin/extraction variants) even when the
+   *                                 ingredients stay distinct
+   *
+   * Run from the repo root:   node import_datasets.js
+   */
 
 const fs = require("fs");
 const path = require("path");
 const { Client } = require("pg");
 const { parse } = require("csv-parse/sync");
 
-// --- DB config: prefer env vars; the fallback is a LOCAL dev default only.
-//     Do not commit real secrets. Set PGPASSWORD in your shell instead.
 const dbConfig = {
   user: process.env.PGUSER || "postgres",
   host: process.env.PGHOST || "localhost",
@@ -45,78 +34,129 @@ const dbConfig = {
   port: parseInt(process.env.PGPORT || "5432", 10),
 };
 
-// Optional: path to the JSON produced by scrape_fragrantica_notes.js.
-// If the file doesn't exist, stage 4 is skipped with a warning (it's not
-// required for stages 1-3 to work).
 const INGREDIENT_IMAGES_FILE =
   process.env.INGREDIENT_IMAGES_FILE || "ingredient_images.json";
 const UNMATCHED_INGREDIENT_IMAGES_FILE = "unmatched_ingredient_images.csv";
 
 // =====================================================================
-//  Alias configuration - EXTEND THESE FREELY.
-//  Keys are the *normalized* surface form; values are the canonical
-//  display name. Only add entries you are sure mean the same thing:
-//  over-merging is worse than a couple of duplicates. For candidates you
-//  are not sure about, use the pg_trgm query described alongside this
-//  script to review before adding them here.
+//  Alias / dedup configuration
 // =====================================================================
 
-// variant (normalized) -> canonical ingredient display name
 const INGREDIENT_ALIASES = {
   cedar: "Cedarwood",
   cedarwood: "Cedarwood",
   agarwood: "Oud",
-  "agarwood oud": "Oud", // "Agarwood (Oud)" normalizes to "agarwood oud"
+  "agarwood oud": "Oud",
   oud: "Oud",
-  // --- examples of geographic-qualifier merges: uncomment/extend if wanted ---
-  // 'sicilian bergamot':  'Bergamot',
-  // 'calabrian bergamot': 'Bergamot',
-  // 'amalfi bergamot':    'Bergamot',
-  // 'virginia cedar':     'Cedarwood',
-  // 'french lavender':    'Lavender',
-  // 'wild lavender':      'Lavender',
-  // 'orris':              'Iris',
 };
 
-// variant (normalized) -> canonical accord display name
 const ACCORD_ALIASES = {
   leathery: "leather",
   animal: "animalic",
 };
 
-// variant (normalized) -> canonical brand display name.
-// Typographic duplicates (&, apostrophes, ® ™ ©) are already merged by
-// normalize() above and don't need an entry here. This map is only for
-// genuine "different string, same brand" cases - short house name vs a
-// longer variant with "Perfumes"/"Parfums"/"Arts Perfume"/etc. appended.
-// Find candidates with the containment query in the project notes rather
-// than guessing; only add entries you've actually confirmed.
 const BRAND_ALIASES = {
-  "afnan perfumes": "Afnan",
-  "aether arts perfume": "Aether",
+  // "yves saint laurent": "YSL",
 };
 
+const BRAND_SUFFIXES = [
+  "arts perfume",
+  "perfumes",
+  "perfume",
+  "parfums",
+  "parfum",
+  "fragrances",
+  "fragrance",
+  "cosmetics",
+];
+
+const BRAND_MERGE_MIN_SHARED_TITLES = 4;
+
+// Qualifier tokens for INGREDIENT reconciliation and photo grouping.
+// These denote origin or extraction method, NOT a different material, so
+// they are safe to strip. Words that change identity (water, milk, blossom,
+// leaf, wood, pink, black, sea, smoked, green, salted, ...) are deliberately
+// NOT here, so "Coconut Water" != "Coconut", "Pink Pepper" != "Pepper".
+const GEO_QUALIFIERS = [
+  "african",
+  "sicilian",
+  "calabrian",
+  "amalfi",
+  "egyptian",
+  "indian",
+  "turkish",
+  "bulgarian",
+  "moroccan",
+  "italian",
+  "french",
+  "spanish",
+  "australian",
+  "virginia",
+  "virginian",
+  "haitian",
+  "madagascan",
+  "madagascar",
+  "somali",
+  "chinese",
+  "russian",
+  "brazilian",
+  "guatemalan",
+  "ceylon",
+  "tahitian",
+  "indonesian",
+  "javanese",
+  "arabian",
+  "persian",
+  "mexican",
+  "japanese",
+  "korean",
+  "tunisian",
+  "greek",
+  "portuguese",
+  "texas",
+  "bourbon",
+  "ugandan",
+  "dominican",
+  "polynesian",
+  "comorian",
+  "reunion",
+  "cambodian",
+  "laotian",
+  "atlas",
+  "peruvian",
+  "colombian",
+  "paraguayan",
+  "american",
+  "californian",
+];
+const EXTRACT_QUALIFIERS = [
+  "absolute",
+  "absolue",
+  "concrete",
+  "co2",
+  "oil",
+  "essence",
+  "essential",
+  "extract",
+  "orpur",
+  "tincture",
+  "resinoid",
+  "resin",
+];
+const QUAL = new Set([...GEO_QUALIFIERS, ...EXTRACT_QUALIFIERS]);
+
 // =====================================================================
-//  Normalization
+//  Normalization / small helpers
 // =====================================================================
 
-// Lowercase, strip diacritics, strip trademark/registered/copyright
-// symbols, fold "&" and apostrophes into a plain separator, collapse
-// separators/punctuation to single spaces.
-// "Lily-of-the-Valley" and "Lily of the valley" both become
-// "lily of the valley"; "Akigalawood®" -> "akigalawood";
-// "Abercrombie & Fitch" -> "abercrombie fitch" = "Abercrombie Fitch";
-// "Acqua dell'Elba" -> "acqua dell elba" = "Acqua dell Elba".
-// Semantic merges (Acetylfuran = Acetyl Furan, Afnan = Afnan Perfumes)
-// still need an explicit alias - normalize() only handles typography.
 function normalize(str) {
   if (!str) return "";
   return String(str)
     .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "") // remove diacritics
-    .replace(/[®™©]/g, "") // strip trademark symbols
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[®™©]/g, "")
     .toLowerCase()
-    .replace(/[\-_/.,()\[\]&'’‘`]/g, " ") // fold punctuation incl. & and apostrophes
+    .replace(/[\-_/.,()\[\]&'’‘`]/g, " ")
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -131,13 +171,64 @@ function isMissing(v) {
   return t === "" || t.toUpperCase() === "NA";
 }
 
+function canonicalizeBrand(rawName) {
+  let display = String(rawName).split("/")[0].trim();
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const s of BRAND_SUFFIXES) {
+      const re = new RegExp("\\s+" + s.replace(/ /g, "\\s+") + "\\s*$", "i");
+      if (re.test(display)) {
+        display = display.replace(re, "").trim();
+        changed = true;
+      }
+    }
+  }
+  return display;
+}
+
+// Fully-stripped form (all qualifiers removed) - used for the VISUAL photo group.
+function aggressiveCanonical(norm) {
+  const core = norm.split(" ").filter((t) => t && !QUAL.has(t));
+  return core.length ? core.join(" ") : norm;
+}
+
+// Choose where a note-only ingredient should go (Policy A):
+//  - most specific glossary anchor reachable by removing only qualifiers;
+//  - else a canonical base (core tokens);
+//  - else keep as-is.
+// anchorSets: Map sortedTokenKey -> { id }.
+function chooseIngredientTarget(noteNorm, anchorSets) {
+  const tokens = noteNorm.split(" ").filter(Boolean);
+  const core = tokens.filter((t) => !QUAL.has(t));
+  const quals = tokens.filter((t) => QUAL.has(t));
+  if (core.length === 0) return { type: "keep" };
+
+  let best = null;
+  const n = quals.length;
+  for (let mask = 0; mask < 1 << n; mask++) {
+    const setTokens = core.slice();
+    for (let i = 0; i < n; i++) if (mask & (1 << i)) setTokens.push(quals[i]);
+    const key = [...new Set(setTokens)].sort().join(" ");
+    const anchor = anchorSets.get(key);
+    if (anchor && (!best || setTokens.length > best.size)) {
+      best = { id: anchor.id, size: setTokens.length };
+    }
+  }
+  if (best) return { type: "anchor", id: best.id };
+
+  const baseNorm = core.join(" ");
+  if (baseNorm === noteNorm) return { type: "keep" };
+  return { type: "base", norm: baseNorm };
+}
+
 // =====================================================================
-//  In-memory caches (normalized key -> id) to avoid repeat lookups
+//  In-memory caches
 // =====================================================================
 const brandCache = new Map();
 const ingredientCache = new Map();
 const accordCache = new Map();
-const perfumesWithNotes = new Set(); // perfume ids that already have notes
+const perfumesWithNotes = new Set();
 
 const stats = {
   ingredientsGlossary: 0,
@@ -154,23 +245,29 @@ const stats = {
   perfumeImagesFilled: 0,
   ingredientImagesMatched: 0,
   ingredientImagesUnmatched: 0,
+  brandsMerged: 0,
+  ingredientsMergedAnchor: 0,
+  ingredientsMergedBase: 0,
+  ingredientPhotosPropagated: 0,
 };
 
 // =====================================================================
-//  Dimension resolvers (create-or-get, cached)
+//  Dimension resolvers
 // =====================================================================
 
 async function getBrandId(client, rawName) {
-  const name = isMissing(rawName) ? "Unknown" : rawName.trim();
-  const rawNorm = normalize(name);
-  const aliasTarget = BRAND_ALIASES[rawNorm];
-  const display = aliasTarget || name;
-  const norm = aliasTarget ? normalize(aliasTarget) : rawNorm;
+  let cleaned = isMissing(rawName) ? "Unknown" : canonicalizeBrand(rawName);
+  if (!cleaned) cleaned = String(rawName).trim() || "Unknown";
+  let norm = normalize(cleaned);
+  const aliasTarget = BRAND_ALIASES[normalize(rawName)] || BRAND_ALIASES[norm];
+  const display = aliasTarget || cleaned;
+  if (aliasTarget) norm = normalize(aliasTarget);
+  if (!norm) norm = "unknown";
   if (brandCache.has(norm)) return brandCache.get(norm);
   const res = await client.query(
     `INSERT INTO brands (name, name_normalized) VALUES ($1, $2)
-       ON CONFLICT (name_normalized) DO UPDATE SET name = brands.name
-       RETURNING id`,
+         ON CONFLICT (name_normalized) DO UPDATE SET name = brands.name
+         RETURNING id`,
     [display, norm]
   );
   const id = res.rows[0].id;
@@ -179,8 +276,6 @@ async function getBrandId(client, rawName) {
   return id;
 }
 
-// Resolve a raw note/ingredient name to a canonical ingredient id,
-// applying the alias map and recording surface forms as aliases.
 async function resolveIngredientId(client, rawName) {
   if (isMissing(rawName)) return null;
   const rawNorm = normalize(rawName);
@@ -196,8 +291,8 @@ async function resolveIngredientId(client, rawName) {
   } else {
     const res = await client.query(
       `INSERT INTO ingredients (name, name_normalized) VALUES ($1, $2)
-         ON CONFLICT (name_normalized) DO UPDATE SET name = ingredients.name
-         RETURNING id`,
+           ON CONFLICT (name_normalized) DO UPDATE SET name = ingredients.name
+           RETURNING id`,
       [display, norm]
     );
     id = res.rows[0].id;
@@ -205,16 +300,17 @@ async function resolveIngredientId(client, rawName) {
     stats.ingredientsTotal = ingredientCache.size;
   }
 
-  // Record both the canonical form and the raw surface form as aliases.
   await client.query(
-    `INSERT INTO ingredient_aliases (alias_normalized, ingredient_id) VALUES ($1, $2)
-       ON CONFLICT (alias_normalized) DO NOTHING`,
+    `INSERT INTO ingredient_aliases (alias_normalized, ingredient_id) VALUES
+  ($1, $2)
+         ON CONFLICT (alias_normalized) DO NOTHING`,
     [norm, id]
   );
   if (rawNorm !== norm) {
     await client.query(
-      `INSERT INTO ingredient_aliases (alias_normalized, ingredient_id) VALUES ($1, $2)
-         ON CONFLICT (alias_normalized) DO NOTHING`,
+      `INSERT INTO ingredient_aliases (alias_normalized, ingredient_id) VALUES
+  ($1, $2)
+           ON CONFLICT (alias_normalized) DO NOTHING`,
       [rawNorm, id]
     );
   }
@@ -231,8 +327,8 @@ async function resolveAccordId(client, rawName) {
   if (accordCache.has(norm)) return accordCache.get(norm);
   const res = await client.query(
     `INSERT INTO accords (name, name_normalized) VALUES ($1, $2)
-       ON CONFLICT (name_normalized) DO UPDATE SET name = accords.name
-       RETURNING id`,
+         ON CONFLICT (name_normalized) DO UPDATE SET name = accords.name
+         RETURNING id`,
     [display, norm]
   );
   const id = res.rows[0].id;
@@ -254,14 +350,17 @@ async function upsertPerfume(
   const cleanTitle = title.trim();
   const titleNorm = normalize(cleanTitle);
   const res = await client.query(
-    `INSERT INTO perfumes (brand_id, title, title_normalized, description, release_year, perfumer, image_url)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
-       ON CONFLICT (brand_id, title_normalized) DO UPDATE SET
-          description  = COALESCE(perfumes.description,  EXCLUDED.description),
-          release_year = COALESCE(perfumes.release_year, EXCLUDED.release_year),
-          perfumer     = COALESCE(perfumes.perfumer,     EXCLUDED.perfumer),
-          image_url    = COALESCE(perfumes.image_url,    EXCLUDED.image_url)
-       RETURNING id, (xmax <> 0) AS existed`,
+    `INSERT INTO perfumes (brand_id, title, title_normalized, description,
+  release_year, perfumer, image_url)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
+         ON CONFLICT (brand_id, title_normalized) DO UPDATE SET
+            description  = COALESCE(perfumes.description,
+  EXCLUDED.description),
+            release_year = COALESCE(perfumes.release_year,
+  EXCLUDED.release_year),
+            perfumer     = COALESCE(perfumes.perfumer,     EXCLUDED.perfumer),
+            image_url    = COALESCE(perfumes.image_url,    EXCLUDED.image_url)
+         RETURNING id, (xmax <> 0) AS existed`,
     [
       brandId,
       cleanTitle,
@@ -282,8 +381,9 @@ async function addNote(client, perfumeId, rawNote, layer) {
   const ingredientId = await resolveIngredientId(client, rawNote);
   if (!ingredientId) return false;
   await client.query(
-    `INSERT INTO perfume_notes (perfume_id, ingredient_id, layer) VALUES ($1, $2, $3)
-       ON CONFLICT (perfume_id, ingredient_id, layer) DO NOTHING`,
+    `INSERT INTO perfume_notes (perfume_id, ingredient_id, layer) VALUES ($1,
+  $2, $3)
+         ON CONFLICT (perfume_id, ingredient_id, layer) DO NOTHING`,
     [perfumeId, ingredientId, layer]
   );
   stats.notes++;
@@ -295,9 +395,10 @@ async function addAccord(client, perfumeId, rawAccord, rank) {
   const accordId = await resolveAccordId(client, rawAccord);
   if (!accordId) return;
   await client.query(
-    `INSERT INTO perfume_accords (perfume_id, accord_id, rank) VALUES ($1, $2, $3)
-       ON CONFLICT (perfume_id, accord_id) DO UPDATE
-          SET rank = LEAST(perfume_accords.rank, EXCLUDED.rank)`,
+    `INSERT INTO perfume_accords (perfume_id, accord_id, rank) VALUES ($1, $2,
+  $3)
+         ON CONFLICT (perfume_id, accord_id) DO UPDATE
+            SET rank = LEAST(perfume_accords.rank, EXCLUDED.rank)`,
     [perfumeId, accordId, rank]
   );
 }
@@ -306,8 +407,6 @@ async function addAccord(client, perfumeId, rawAccord, rank) {
 //  Parsers
 // =====================================================================
 
-// Fragrantica "Name" glues title + brand + gender, e.g. "9am Afnanfor women".
-// Rebuild the clean title by stripping the trailing brand+gender.
 function cleanFragranticaTitle(rawName, brandName, gender) {
   let t = rawName.trim();
   const b = (brandName || "").trim();
@@ -330,11 +429,6 @@ function extractBrandFromFragranticaUrl(url) {
   return m && m[1] ? m[1].replace(/-/g, " ").trim() : "Unknown";
 }
 
-// Fragrantica perfume pages end in "...-<numericId>.html". The site's own
-// CDN serves thumbnails at a predictable path keyed by that same id, so we
-// can derive the image URL without scraping each perfume page individually:
-//   https://www.fragrantica.com/perfume/Afnan/Afzal-Abeer-27378.html
-//   -> https://fimgs.net/mdimg/perfume-thumbs/375x500.27378.jpg
 function extractFragranticaImage(url) {
   if (!url) return null;
   const m = url.match(/-(\d+)\.html\s*$/);
@@ -342,8 +436,6 @@ function extractFragranticaImage(url) {
   return `https://fimgs.net/mdimg/perfume-thumbs/375x500.${m[1]}.jpg`;
 }
 
-// Fragrantica notes live inside the free-text Description:
-// "... Top notes are X; middle notes are Y; base notes are Z."
 function parseFragranticaNotes(description) {
   const out = { top: [], heart: [], base: [] };
   if (!description) return out;
@@ -351,7 +443,7 @@ function parseFragranticaNotes(description) {
     const m = description.match(re);
     if (!m) return [];
     return m[1]
-      .split(".")[0] // stop at the sentence end
+      .split(".")[0]
       .split(/,\s*|\s+and\s+/i)
       .map((n) => n.trim())
       .filter(Boolean);
@@ -362,7 +454,6 @@ function parseFragranticaNotes(description) {
   return out;
 }
 
-// Fragrantica "Main Accords" is a python-list string: "['citrus', 'woody']"
 function parseFragranticaAccords(str) {
   if (!str) return [];
   try {
@@ -379,7 +470,7 @@ function parseFragranticaAccords(str) {
 }
 
 // =====================================================================
-//  Stages
+//  Stages 1-3
 // =====================================================================
 
 async function importGlossary(client) {
@@ -404,27 +495,43 @@ async function importGlossary(client) {
 
       const res = await client.query(
         `INSERT INTO ingredients (
-              name, name_normalized, category, subcategory, short_description, botanical_name,
-              appearance, odor_strength, producing_countries, typical_volatility,
-              evolution_immediate, evolution_after_hours, evolution_after_days,
-              full_extracted_text, source_url, from_glossary
-           ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,TRUE)
-           ON CONFLICT (name_normalized) DO UPDATE SET
-              category              = COALESCE(EXCLUDED.category, ingredients.category),
-              subcategory           = COALESCE(EXCLUDED.subcategory, ingredients.subcategory),
-              short_description     = COALESCE(EXCLUDED.short_description, ingredients.short_description),
-              botanical_name        = COALESCE(EXCLUDED.botanical_name, ingredients.botanical_name),
-              appearance            = COALESCE(EXCLUDED.appearance, ingredients.appearance),
-              odor_strength         = COALESCE(EXCLUDED.odor_strength, ingredients.odor_strength),
-              producing_countries   = COALESCE(EXCLUDED.producing_countries, ingredients.producing_countries),
-              typical_volatility    = COALESCE(EXCLUDED.typical_volatility, ingredients.typical_volatility),
-              evolution_immediate   = COALESCE(EXCLUDED.evolution_immediate, ingredients.evolution_immediate),
-              evolution_after_hours = COALESCE(EXCLUDED.evolution_after_hours, ingredients.evolution_after_hours),
-              evolution_after_days  = COALESCE(EXCLUDED.evolution_after_days, ingredients.evolution_after_days),
-              full_extracted_text   = COALESCE(EXCLUDED.full_extracted_text, ingredients.full_extracted_text),
-              source_url            = COALESCE(EXCLUDED.source_url, ingredients.source_url),
-              from_glossary         = TRUE
-           RETURNING id`,
+                name, name_normalized, category, subcategory, short_description,
+  botanical_name,
+                appearance, odor_strength, producing_countries,
+  typical_volatility,
+                evolution_immediate, evolution_after_hours,
+  evolution_after_days,
+                full_extracted_text, source_url, from_glossary
+             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,TRUE)
+             ON CONFLICT (name_normalized) DO UPDATE SET
+                category              = COALESCE(EXCLUDED.category,
+  ingredients.category),
+                subcategory           = COALESCE(EXCLUDED.subcategory,
+  ingredients.subcategory),
+                short_description     = COALESCE(EXCLUDED.short_description,
+  ingredients.short_description),
+                botanical_name        = COALESCE(EXCLUDED.botanical_name,
+  ingredients.botanical_name),
+                appearance            = COALESCE(EXCLUDED.appearance,
+  ingredients.appearance),
+                odor_strength         = COALESCE(EXCLUDED.odor_strength,
+  ingredients.odor_strength),
+                producing_countries   = COALESCE(EXCLUDED.producing_countries,
+  ingredients.producing_countries),
+                typical_volatility    = COALESCE(EXCLUDED.typical_volatility,
+  ingredients.typical_volatility),
+                evolution_immediate   = COALESCE(EXCLUDED.evolution_immediate,
+  ingredients.evolution_immediate),
+                evolution_after_hours = COALESCE(EXCLUDED.evolution_after_hours,
+  ingredients.evolution_after_hours),
+                evolution_after_days  = COALESCE(EXCLUDED.evolution_after_days,
+  ingredients.evolution_after_days),
+                full_extracted_text   = COALESCE(EXCLUDED.full_extracted_text,
+  ingredients.full_extracted_text),
+                source_url            = COALESCE(EXCLUDED.source_url,
+  ingredients.source_url),
+                from_glossary         = TRUE
+             RETURNING id`,
         [
           display,
           norm,
@@ -452,15 +559,15 @@ async function importGlossary(client) {
       const id = res.rows[0].id;
       ingredientCache.set(norm, id);
       await client.query(
-        `INSERT INTO ingredient_aliases (alias_normalized, ingredient_id) VALUES ($1, $2)
-           ON CONFLICT (alias_normalized) DO NOTHING`,
+        `INSERT INTO ingredient_aliases (alias_normalized, ingredient_id)
+  VALUES ($1, $2)
+             ON CONFLICT (alias_normalized) DO NOTHING`,
         [norm, id]
       );
       stats.ingredientsGlossary++;
     } catch (e) {
-      console.error(
-        `Voce glossario scartata (${item && item.term}): ${e.message}`
-      );
+      console.error(`Voce glossario scartata (${item && item.term}):
+  ${e.message}`);
     }
   }
   stats.ingredientsTotal = ingredientCache.size;
@@ -516,15 +623,12 @@ async function importParfumo(client) {
       console.error(`Riga Parfumo #${i} (${r.Name}) scartata: ${e.message}`);
     }
   }
-  console.log(
-    `     ${stats.perfumesParfumo} profumi importati, ${stats.parfumoErrors} righe scartate.`
-  );
+  console.log(`     ${stats.perfumesParfumo} profumi importati,
+  ${stats.parfumoErrors} righe scartate.`);
 }
 
 async function importFragrantica(client) {
-  console.log(
-    "\n3/4  Fragrantica (merge + fallback note + accordi + foto) ..."
-  );
+  console.log("\n3/4  Fragrantica (merge + fallback note + accordi + foto)...");
   const records = parse(fs.readFileSync("fra_perfumes.csv", "utf8"), {
     columns: true,
     skip_empty_lines: true,
@@ -546,7 +650,6 @@ async function importFragrantica(client) {
         imageUrl,
       });
 
-      // Notes only if this perfume still has none (Parfumo is authoritative).
       if (!perfumesWithNotes.has(perfumeId)) {
         const notes = parseFragranticaNotes(r.Description);
         const total = notes.top.length + notes.heart.length + notes.base.length;
@@ -568,33 +671,303 @@ async function importFragrantica(client) {
       stats.perfumesFragrantica++;
     } catch (e) {
       stats.fragranticaErrors++;
-      console.error(
-        `Riga Fragrantica #${i} (${r.Name}) scartata: ${e.message}`
-      );
+      console.error(`Riga Fragrantica #${i} (${r.Name}) scartata:
+  ${e.message}`);
     }
   }
   console.log(
     `     ${stats.perfumesFragrantica} righe importate ` +
-      `(${stats.fragranticaNoNotes} senza note estraibili, ${stats.fragranticaErrors} scartate per errore).`
+      `(${stats.fragranticaNoNotes} senza note estraibili,
+  ${stats.fragranticaErrors} scartate per errore).`
   );
 }
 
-// Stage 4: enrich ingredients.image_url from the JSON produced by
-// scrape_fragrantica_notes.js. Matching goes through ingredient_aliases,
-// so it works regardless of which exact spelling the scraper found.
-// Anything that doesn't match an existing alias is written to a CSV for
-// manual review instead of silently creating a new ingredient row - a
-// scraped note name could be a typo, a new alias, or genuinely a note
-// your dataset never saw, and those need different treatment.
+// =====================================================================
+//  Brand dedup by title overlap
+// =====================================================================
+
+async function mergeBrandInto(client, keepId, dropId) {
+  await client.query(
+    `INSERT INTO perfume_notes (perfume_id, ingredient_id, layer)
+       SELECT pa.id, pn.ingredient_id, pn.layer
+         FROM perfumes pb
+         JOIN perfumes pa ON pa.brand_id = $1 AND pa.title_normalized =
+  pb.title_normalized
+         JOIN perfume_notes pn ON pn.perfume_id = pb.id
+        WHERE pb.brand_id = $2
+       ON CONFLICT (perfume_id, ingredient_id, layer) DO NOTHING`,
+    [keepId, dropId]
+  );
+  await client.query(
+    `INSERT INTO perfume_accords (perfume_id, accord_id, rank)
+       SELECT pa.id, pac.accord_id, pac.rank
+         FROM perfumes pb
+         JOIN perfumes pa ON pa.brand_id = $1 AND pa.title_normalized =
+  pb.title_normalized
+         JOIN perfume_accords pac ON pac.perfume_id = pb.id
+        WHERE pb.brand_id = $2
+       ON CONFLICT (perfume_id, accord_id) DO UPDATE
+          SET rank = LEAST(perfume_accords.rank, EXCLUDED.rank)`,
+    [keepId, dropId]
+  );
+  await client.query(
+    `UPDATE perfumes pa SET
+          description  = COALESCE(pa.description,  pb.description),
+          release_year = COALESCE(pa.release_year, pb.release_year),
+          perfumer     = COALESCE(pa.perfumer,     pb.perfumer),
+          image_url    = COALESCE(pa.image_url,    pb.image_url)
+         FROM perfumes pb
+        WHERE pa.brand_id = $1 AND pb.brand_id = $2
+          AND pa.title_normalized = pb.title_normalized`,
+    [keepId, dropId]
+  );
+  await client.query(
+    `DELETE FROM perfumes pb
+        WHERE pb.brand_id = $2
+          AND EXISTS (SELECT 1 FROM perfumes pa
+                       WHERE pa.brand_id = $1 AND pa.title_normalized =
+  pb.title_normalized)`,
+    [keepId, dropId]
+  );
+  await client.query(`UPDATE perfumes SET brand_id = $1 WHERE brand_id = $2`, [
+    keepId,
+    dropId,
+  ]);
+  await client.query(`DELETE FROM brands WHERE id = $2`, [dropId]);
+}
+
+async function mergeDuplicateBrands(client) {
+  console.log("\n3b/4  Dedup brand per overlap di titoli ...");
+  await client.query(`CREATE INDEX IF NOT EXISTS idx_perfumes_title_norm ON
+  perfumes(title_normalized)`);
+
+  const { rows: pairs } = await client.query(
+    `SELECT ba.id AS a_id, ba.name AS a_name, ba.name_normalized AS a_norm,
+              bb.id AS b_id, bb.name AS b_name, bb.name_normalized AS b_norm,
+              count(*)::int AS shared,
+              similarity(ba.name_normalized, bb.name_normalized) AS sim
+         FROM perfumes p1
+         JOIN perfumes p2 ON p1.title_normalized = p2.title_normalized AND
+  p1.brand_id < p2.brand_id
+         JOIN brands ba ON ba.id = p1.brand_id
+         JOIN brands bb ON bb.id = p2.brand_id
+        GROUP BY ba.id, ba.name, ba.name_normalized, bb.id, bb.name,
+  bb.name_normalized
+       HAVING count(*) >= $1`,
+    [BRAND_MERGE_MIN_SHARED_TITLES]
+  );
+
+  const related = (a, b) => {
+    const ta = a.split(" ").filter(Boolean),
+      tb = b.split("").filter(Boolean);
+    const sa = new Set(ta),
+      sb = new Set(tb);
+    const subset = ta.every((t) => sb.has(t)) || tb.every((t) => sa.has(t));
+    return subset || a.includes(b) || b.includes(a);
+  };
+  const confirmed = pairs.filter(
+    (p) => Number(p.sim) >= 0.45 || related(p.a_norm, p.b_norm)
+  );
+
+  const nameById = new Map();
+  for (const p of pairs) {
+    nameById.set(String(p.a_id), p.a_name);
+    nameById.set(String(p.b_id), p.b_name);
+  }
+
+  const parent = new Map();
+  const find = (x) => {
+    while (parent.get(x) !== x) {
+      parent.set(x, parent.get(parent.get(x)));
+      x = parent.get(x);
+    }
+    return x;
+  };
+  for (const p of confirmed) {
+    if (!parent.has(p.a_id)) parent.set(p.a_id, p.a_id);
+    if (!parent.has(p.b_id)) parent.set(p.b_id, p.b_id);
+    parent.set(find(p.a_id), find(p.b_id));
+  }
+  const groups = new Map();
+  for (const id of parent.keys()) {
+    const root = find(id);
+    if (!groups.has(root)) groups.set(root, []);
+    groups.get(root).push(id);
+  }
+
+  let mergedCount = 0,
+    groupCount = 0;
+  for (const ids of groups.values()) {
+    if (ids.length < 2) continue;
+    groupCount++;
+    const { rows: counts } = await client.query(
+      `SELECT brand_id, count(*)::int AS n FROM perfumes WHERE brand_id =
+  ANY($1::bigint[]) GROUP BY brand_id`,
+      [ids]
+    );
+    const cnt = new Map(counts.map((r) => [String(r.brand_id), r.n]));
+    ids.sort((x, y) => (cnt.get(String(y)) || 0) - (cnt.get(String(x)) || 0));
+    const keep = ids[0];
+    for (const drop of ids.slice(1)) {
+      await mergeBrandInto(client, keep, drop);
+      console.log(`     fuso "${nameById.get(String(drop))}"  ->
+  "${nameById.get(String(keep))}"`);
+      mergedCount++;
+    }
+  }
+  stats.brandsMerged = mergedCount;
+  console.log(`     ${confirmed.length} coppie confermate, ${mergedCount}
+  brand fusi in ${groupCount} gruppi.`);
+}
+
+// =====================================================================
+//  Ingredient reconciliation (Policy A) + photo propagation
+// =====================================================================
+
+async function mergeIngredientInto(client, keepId, dropId) {
+  if (String(keepId) === String(dropId)) return;
+  await client.query(
+    `INSERT INTO perfume_notes (perfume_id, ingredient_id, layer)
+       SELECT perfume_id, $1, layer FROM perfume_notes WHERE ingredient_id = $2
+       ON CONFLICT (perfume_id, ingredient_id, layer) DO NOTHING`,
+    [keepId, dropId]
+  );
+  await client.query(
+    `UPDATE ingredient_aliases SET ingredient_id = $1 WHERE ingredient_id =
+  $2`,
+    [keepId, dropId]
+  );
+  await client.query(
+    `UPDATE ingredients k SET
+          category              = COALESCE(k.category, d.category),
+          subcategory           = COALESCE(k.subcategory, d.subcategory),
+          short_description     = COALESCE(k.short_description,
+  d.short_description),
+          botanical_name        = COALESCE(k.botanical_name, d.botanical_name),
+          appearance            = COALESCE(k.appearance, d.appearance),
+          odor_strength         = COALESCE(k.odor_strength, d.odor_strength),
+          producing_countries   = COALESCE(k.producing_countries,
+  d.producing_countries),
+          typical_volatility    = COALESCE(k.typical_volatility,
+  d.typical_volatility),
+          evolution_immediate   = COALESCE(k.evolution_immediate,
+  d.evolution_immediate),
+          evolution_after_hours = COALESCE(k.evolution_after_hours,
+  d.evolution_after_hours),
+          evolution_after_days  = COALESCE(k.evolution_after_days,
+  d.evolution_after_days),
+          full_extracted_text   = COALESCE(k.full_extracted_text,
+  d.full_extracted_text),
+          source_url            = COALESCE(k.source_url, d.source_url),
+          image_url             = COALESCE(k.image_url, d.image_url),
+          from_glossary         = k.from_glossary OR d.from_glossary
+         FROM ingredients d
+        WHERE k.id = $1 AND d.id = $2`,
+    [keepId, dropId]
+  );
+  await client.query(`DELETE FROM ingredients WHERE id = $2`, [dropId]);
+}
+
+async function reconcileIngredients(client) {
+  console.log("\n3c/4  Riconciliazione ingredienti (Policy A) ...");
+  const { rows } = await client.query(
+    `SELECT id, name_normalized, from_glossary FROM ingredients`
+  );
+
+  // Glossary anchors indexed by their sorted token set; never merged.
+  const anchorSets = new Map(); // sortedKey -> { id }
+  const idByNorm = new Map(); // norm -> id
+  for (const r of rows) {
+    idByNorm.set(r.name_normalized, r.id);
+    if (r.from_glossary) {
+      const key = [...new Set(r.name_normalized.split("").filter(Boolean))]
+        .sort()
+        .join(" ");
+      if (!anchorSets.has(key)) anchorSets.set(key, { id: r.id });
+    }
+  }
+
+  for (const r of rows) {
+    if (r.from_glossary) continue; // anchors stay put
+    const t = chooseIngredientTarget(r.name_normalized, anchorSets);
+    if (t.type === "keep") continue;
+
+    if (t.type === "anchor") {
+      if (String(t.id) !== String(r.id)) {
+        await mergeIngredientInto(client, t.id, r.id);
+        stats.ingredientsMergedAnchor++;
+      }
+    } else if (t.type === "base") {
+      let baseId = idByNorm.get(t.norm);
+      if (!baseId) {
+        const disp = t.norm.replace(/\b\w/g, (c) => c.toUpperCase());
+        const res = await client.query(
+          `INSERT INTO ingredients (name, name_normalized) VALUES ($1, $2)
+             ON CONFLICT (name_normalized) DO UPDATE SET name = ingredients.name
+  RETURNING id`,
+          [disp, t.norm]
+        );
+        baseId = res.rows[0].id;
+        idByNorm.set(t.norm, baseId);
+        await client.query(
+          `INSERT INTO ingredient_aliases (alias_normalized, ingredient_id)
+  VALUES ($1, $2)
+             ON CONFLICT (alias_normalized) DO NOTHING`,
+          [t.norm, baseId]
+        );
+      }
+      if (String(baseId) !== String(r.id)) {
+        await mergeIngredientInto(client, baseId, r.id);
+        stats.ingredientsMergedBase++;
+      }
+    }
+  }
+  console.log(
+    `     ${stats.ingredientsMergedAnchor} note agganciate a voci di
+  glossario, ` + `${stats.ingredientsMergedBase} fuse in basi canoniche.`
+  );
+}
+
+async function propagateIngredientImages(client) {
+  console.log("\n4b/4  Propagazione foto nel gruppo visivo ...");
+  const { rows } = await client.query(`SELECT id, name_normalized, image_url
+  FROM ingredients`);
+  const groups = new Map();
+  for (const r of rows) {
+    const canon = aggressiveCanonical(r.name_normalized);
+    if (!groups.has(canon)) groups.set(canon, []);
+    groups.get(canon).push(r);
+  }
+  let filled = 0;
+  for (const members of groups.values()) {
+    if (members.length < 2) continue;
+    const withImg = members.find((m) => m.image_url);
+    if (!withImg) continue;
+    for (const m of members) {
+      if (!m.image_url) {
+        await client.query(
+          `UPDATE ingredients SET image_url = $1 WHERE id = $2 AND image_url
+  IS NULL`,
+          [withImg.image_url, m.id]
+        );
+        filled++;
+      }
+    }
+  }
+  stats.ingredientPhotosPropagated = filled;
+  console.log(`     ${filled} foto propagate a ingredienti dello stesso gruppo
+  visivo.`);
+}
+
+// =====================================================================
+//  Stage 4: ingredient photos from the scrape
+// =====================================================================
+
 async function importIngredientImages(client) {
   console.log("\n4/4  Foto ingredienti (da ingredient_images.json) ...");
   if (!fs.existsSync(INGREDIENT_IMAGES_FILE)) {
-    console.log(
-      `     File ${INGREDIENT_IMAGES_FILE} non trovato, stage saltato.`
-    );
-    console.log(
-      "     Genera questo file con scrape_fragrantica_notes.js quando vuoi popolare le foto."
-    );
+    console.log(`     File ${INGREDIENT_IMAGES_FILE} non trovato, stage
+  saltato.`);
     return;
   }
 
@@ -602,15 +975,14 @@ async function importIngredientImages(client) {
   console.log(`     ${items.length} voci lette dal file scraping.`);
 
   const unmatched = [];
-
   for (const item of items) {
     try {
       if (!item || !item.name || !item.image_url) continue;
       const norm = normalize(item.name);
       if (!norm) continue;
-
       const res = await client.query(
-        `SELECT ingredient_id FROM ingredient_aliases WHERE alias_normalized = $1`,
+        `SELECT ingredient_id FROM ingredient_aliases WHERE alias_normalized =
+  $1`,
         [norm]
       );
       if (res.rows.length === 0) {
@@ -619,14 +991,14 @@ async function importIngredientImages(client) {
         continue;
       }
       await client.query(
-        `UPDATE ingredients SET image_url = COALESCE(image_url, $1) WHERE id = $2`,
+        `UPDATE ingredients SET image_url = COALESCE(image_url, $1) WHERE id =
+  $2`,
         [item.image_url, res.rows[0].ingredient_id]
       );
       stats.ingredientImagesMatched++;
     } catch (e) {
-      console.error(
-        `Voce foto ingrediente scartata (${item && item.name}): ${e.message}`
-      );
+      console.error(`Voce foto ingrediente scartata (${item && item.name}):
+  ${e.message}`);
     }
   }
 
@@ -636,13 +1008,11 @@ async function importIngredientImages(client) {
       ...unmatched.map((u) => `"${u.name.replace(/"/g, '""')}",${u.image_url}`),
     ].join("\n");
     fs.writeFileSync(UNMATCHED_INGREDIENT_IMAGES_FILE, csv, "utf8");
-    console.log(
-      `     ${unmatched.length} voci senza corrispondenza scritte in ${UNMATCHED_INGREDIENT_IMAGES_FILE} per revisione manuale.`
-    );
+    console.log(`     ${unmatched.length} voci senza corrispondenza scritte in
+  ${UNMATCHED_INGREDIENT_IMAGES_FILE}.`);
   }
-  console.log(
-    `     ${stats.ingredientImagesMatched} ingredienti aggiornati con una foto.`
-  );
+  console.log(`     ${stats.ingredientImagesMatched} ingredienti aggiornati
+  con una foto.`);
 }
 
 // =====================================================================
@@ -654,7 +1024,6 @@ async function main() {
   console.log("Connesso a Postgres.");
 
   try {
-    // 1) Rebuild schema from the authoritative DDL (drop + create).
     const schemaSql = fs.readFileSync(
       path.join(__dirname, "schema.sql"),
       "utf8"
@@ -662,9 +1031,7 @@ async function main() {
     await client.query(schemaSql);
     console.log("Schema ricreato da schema.sql.");
 
-    // 2) Import stages 1-3 each in its own transaction (per-row error
-    //    handling inside each stage means a bad row no longer costs you
-    //    the whole stage - see importParfumo / importFragrantica above).
+    // Stages 1-3, each in its own transaction.
     for (const [label, fn] of [
       ["glossario", importGlossary],
       ["parfumo", importParfumo],
@@ -677,17 +1044,38 @@ async function main() {
       } catch (e) {
         await client.query("ROLLBACK");
         console.error(
-          `Errore nello stadio "${label}", rollback dello stadio:`,
+          `Errore nello stadio "${label}", rollback dello
+  stadio:`,
           e.message
         );
         throw e;
       }
     }
 
-    // 3) Ingredient photo enrichment - separate, optional, own transaction.
-    //    Kept outside the loop above on purpose: it's not required for the
-    //    core dataset and shouldn't block/rollback if scrape output is
-    //    missing or partially malformed.
+    // 3b) brand dedup
+    await client.query("BEGIN");
+    try {
+      await mergeDuplicateBrands(client);
+      await client.query("COMMIT");
+    } catch (e) {
+      await client.query("ROLLBACK");
+      console.error('Errore nello stadio "dedup brand", rollback:', e.message);
+    }
+
+    // 3c) ingredient identity reconciliation (Policy A)
+    await client.query("BEGIN");
+    try {
+      await reconcileIngredients(client);
+      await client.query("COMMIT");
+    } catch (e) {
+      await client.query("ROLLBACK");
+      console.error(
+        'Errore nello stadio "reconcile ingredienti", rollback:',
+        e.message
+      );
+    }
+
+    // 4) scraped ingredient photos
     await client.query("BEGIN");
     try {
       await importIngredientImages(client);
@@ -695,29 +1083,56 @@ async function main() {
     } catch (e) {
       await client.query("ROLLBACK");
       console.error(
-        'Errore nello stadio "foto ingredienti", rollback dello stadio:',
+        'Errore nello stadio "foto ingredienti", rollback:',
         e.message
       );
     }
 
+    // 4b) propagate one photo per visual group
+    await client.query("BEGIN");
+    try {
+      await propagateIngredientImages(client);
+      await client.query("COMMIT");
+    } catch (e) {
+      await client.query("ROLLBACK");
+      console.error(
+        'Errore nello stadio "propagazione foto", rollback:',
+        e.message
+      );
+    }
+
+    // real counts after all merges
+    const {
+      rows: [bc],
+    } = await client.query("SELECT count(*)::int AS n FROM brands");
+    const {
+      rows: [ic],
+    } = await client.query("SELECT count(*)::int AS n FROM ingredients");
+    stats.brands = bc.n;
+    stats.ingredientsTotal = ic.n;
+
     console.log("\n===== RIEPILOGO =====");
     console.log(`Brand:                        ${stats.brands}`);
-    console.log(
-      `Ingredienti totali:           ${stats.ingredientsTotal} (di cui glossario: ${stats.ingredientsGlossary})`
-    );
+    console.log(`Ingredienti totali:           ${stats.ingredientsTotal} (di
+  cui glossario: ${stats.ingredientsGlossary})`);
+    console.log(`  fusi su voce glossario:
+  ${stats.ingredientsMergedAnchor}`);
+    console.log(`  fusi su base canonica:
+  ${stats.ingredientsMergedBase}`);
     console.log(`Accordi (dimensione):         ${stats.accords}`);
-    console.log(
-      `Profumi Parfumo:              ${stats.perfumesParfumo} (righe scartate: ${stats.parfumoErrors})`
-    );
-    console.log(
-      `Righe Fragrantica:            ${stats.perfumesFragrantica} (righe scartate: ${stats.fragranticaErrors})`
-    );
+    console.log(`Profumi Parfumo:              ${stats.perfumesParfumo} (righe
+  scartate: ${stats.parfumoErrors})`);
+    console.log(`Righe Fragrantica:            ${stats.perfumesFragrantica}
+  (righe scartate: ${stats.fragranticaErrors})`);
     console.log(`Profumi fusi (già esistenti): ${stats.perfumesMerged}`);
     console.log(`Relazioni nota-profumo:       ${stats.notes}`);
     console.log(`Profumi con foto:             ${stats.perfumeImagesFilled}`);
-    console.log(
-      `Ingredienti con foto:         ${stats.ingredientImagesMatched} (senza match: ${stats.ingredientImagesUnmatched})`
-    );
+    console.log(`Ingredienti con foto:
+  ${stats.ingredientImagesMatched} (senza match:
+  ${stats.ingredientImagesUnmatched})`);
+    console.log(`Foto propagate nel gruppo:
+  ${stats.ingredientPhotosPropagated}`);
+    console.log(`Brand fusi (dedup overlap):   ${stats.brandsMerged}`);
     console.log("Import completato.");
   } catch (error) {
     console.error("Errore critico:", error);
