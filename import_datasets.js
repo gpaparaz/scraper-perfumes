@@ -153,10 +153,9 @@ function normalize(str) {
   if (!str) return "";
   return String(str)
     .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/[®™©]/g, "")
+    .replace(/[\u0300-\u036f]/g, "") // remove diacritics
     .toLowerCase()
-    .replace(/[\-_/.,()\[\]&'’‘`]/g, " ")
+    .replace(/[^\p{L}\p{N}]+/gu, " ") // keep only letters/digits, fold rest to space
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -1013,6 +1012,64 @@ async function importIngredientImages(client) {
   }
   console.log(`     ${stats.ingredientImagesMatched} ingredienti aggiornati
   con una foto.`);
+}
+
+// Stage 5: enrich brands.logo_url from the JSON produced by
+// scrape_fragrantica_designers.js. Uses the same alias resolution as the
+// main import (resolveBrandNorm), so a scraped designer name like
+// "Afnan Perfumes" lands on the same brand row as the CSV's "Afnan".
+// Anything that doesn't match an existing brand goes to a CSV for manual
+// review, same reasoning as the ingredient images stage: a name mismatch
+// could be a missing alias, not necessarily a brand you don't have.
+async function importBrandLogos(client) {
+  console.log("\n5/5  Loghi brand (da brand_logos.json) ...");
+  if (!fs.existsSync(BRAND_LOGOS_FILE)) {
+    console.log(`     File ${BRAND_LOGOS_FILE} non trovato, stage saltato.`);
+    console.log(
+      "     Genera questo file con scrape_fragrantica_designers.js quando vuoi popolare i loghi."
+    );
+    return;
+  }
+
+  const items = JSON.parse(fs.readFileSync(BRAND_LOGOS_FILE, "utf8"));
+  console.log(`     ${items.length} voci lette dal file scraping.`);
+
+  const unmatched = [];
+
+  for (const item of items) {
+    try {
+      if (!item || !item.name || !item.logo_url) continue;
+      const { norm } = resolveBrandNorm(item.name);
+      if (!norm) continue;
+
+      const res = await client.query(
+        `UPDATE brands SET logo_url = COALESCE(logo_url, $1) WHERE name_normalized = $2 RETURNING id`,
+        [item.logo_url, norm]
+      );
+      if (res.rows.length === 0) {
+        unmatched.push(item);
+        stats.brandLogosUnmatched++;
+      } else {
+        stats.brandLogosMatched++;
+      }
+    } catch (e) {
+      console.error(
+        `Voce logo brand scartata (${item && item.name}): ${e.message}`
+      );
+    }
+  }
+
+  if (unmatched.length > 0) {
+    const csv = [
+      "name,logo_url",
+      ...unmatched.map((u) => `"${u.name.replace(/"/g, '""')}",${u.logo_url}`),
+    ].join("\n");
+    fs.writeFileSync(UNMATCHED_BRAND_LOGOS_FILE, csv, "utf8");
+    console.log(
+      `     ${unmatched.length} voci senza corrispondenza scritte in ${UNMATCHED_BRAND_LOGOS_FILE} per revisione manuale.`
+    );
+  }
+  console.log(`     ${stats.brandLogosMatched} brand aggiornati con un logo.`);
 }
 
 // =====================================================================
